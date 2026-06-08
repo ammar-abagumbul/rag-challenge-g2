@@ -1,0 +1,15 @@
+[project]
+name = "rag-challenge-g2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "chromadb>=1.5.9",
+    "openai>=2.41.0",
+    "pillow>=12.2.0",
+    "python-dotenv>=1.2.2",
+    "requests>=2.34.2",
+    "transformers>=5.10.2",
+]
