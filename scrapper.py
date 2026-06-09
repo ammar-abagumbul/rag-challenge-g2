@@ -17,13 +17,16 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
+from collections import deque
+
+from preprocess_jsonl import process_multiple_json_arrays
 
 load_dotenv()
 
 SEED_URLS = ["https://innowings.engg.hku.hk/", "https://innoacademy.engg.hku.hk/"]
 # SEED_URLS = ["https://innoacademy.engg.hku.hk/pitching/"]
 ALLOWED_DOMAINS = {"innowings.engg.hku.hk", "innoacademy.engg.hku.hk"}
-MAX_DEPTH = 20
+MAX_DEPTH = 5
 DELAY_SECONDS = 0.5
 CLIP_THRESHOLD = 0.90
 
@@ -43,13 +46,17 @@ azure_client = AzureOpenAI(
 )
 AZURE_VISION_MODEL = "gpt-5-mini"
 
+PREPROCESSED_JSONL = "hku_innowings_chunks.jsonl"
+OUTPUT_JSONL = "hku_innowings_chunks2.jsonl"
+
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name="hku_innowings_scraper")
 
-visited_urls: Set[str] = set()
-transcribed_posters: Dict[str, str] = {}
+
+visited_urls, transcribed_posters = process_multiple_json_arrays(PREPROCESSED_JSONL)
+
 
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
@@ -74,7 +81,6 @@ IMAGE_EXTENSIONS = {
 }
 
 
-OUTPUT_JSONL = "hku_innowings_chunks.jsonl"
 
 
 #TODO: implement the following fixes
@@ -122,7 +128,7 @@ def analyze_image_with_clip(img_url: str) -> bool:
 def get_azure_vision_caption(img_url: str) -> str:
     try:
         if img_url in transcribed_posters:
-            return transcribed_posters[img_url]
+            return transcribed_posters[img_url]["caption"]
 
         response = azure_client.chat.completions.create(
             model=AZURE_VISION_MODEL,
@@ -316,8 +322,86 @@ def crawl_and_process(url: str, depth: int = 1):
         print(f"[!] System processing failure at URL {url}: {e}")
 
 
+def crawl_and_process_bfs(start_url: str):
+    """Iterative BFS core crawler using a queue to process levels sequentially."""
+
+    queue = deque([(start_url, 1)])
+
+    while queue:
+        url, depth = queue.popleft()
+
+        if depth > MAX_DEPTH or url in visited_urls:
+            continue
+
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.netloc not in ALLOWED_DOMAINS:
+            continue
+
+        if is_image_url(url):
+            continue
+
+        print(f"[*] Crawling Depth {depth}: {url}")
+        visited_urls.add(url)
+
+        try:
+            response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if response.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(response.content, "html.parser")
+            sections = clean_and_flatten_dom(soup, url)
+            all_chunks_data = []
+
+            for sec in sections:
+                combined_text = " ".join(sec["content_pieces"]).strip()
+                if not combined_text and not sec["images"]:
+                    continue
+
+                chunk_id = f"hku_innowings_chunk_{uuid.uuid4()}"
+
+                chunk_data = {
+                    "chunk_id": chunk_id,
+                    "parent_url": url,
+                    "text_content": combined_text,
+                    "associated_images": sec["images"],
+                    "url_mappings": sec["url_mappings"],
+                }
+                all_chunks_data.append(chunk_data)
+
+                # Persist directly to Vector Store
+                collection.add(
+                    documents=[chunk_data["text_content"]],
+                    metadatas=[{
+                        "parent_url": chunk_data["parent_url"],
+                        "images_json": str(chunk_data["associated_images"]),
+                        "urls_json": str(chunk_data["url_mappings"]),
+                    }],
+                    ids=[chunk_data["chunk_id"]],
+                )
+
+            with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
+                json.dump(all_chunks_data, f, indent=4, ensure_ascii=False)
+                f.write("\n")
+
+            # Extract child links for Next Depth Exploration
+            for anchor in soup.find_all("a", href=True):
+                next_url = urllib.parse.urljoin(url, anchor["href"])
+                next_url = urllib.parse.urlsplit(next_url)._replace(fragment="").geturl()
+
+                # Add to queue with incremented depth
+                if next_url not in visited_urls:
+                    queue.append((next_url, depth + 1))
+
+            # Politeness delay between requests
+            time.sleep(DELAY_SECONDS)
+
+        except Exception as e:
+            print(f"[!] System processing failure at URL {url}: {e}")
+
+
 if __name__ == "__main__":
     print("[=== Executing Tam Innovation Wing Scraper Init Pipeline ===]")
     for seed in SEED_URLS:
-        crawl_and_process(seed, depth=1)
+        # latest change, haven't run yet but look at TODO's at the start first
+        crawl_and_process_bfs(seed)
     print(f"\n[=== Scrape Complete! Total Chunks Cached: {collection.count()} ===]")
