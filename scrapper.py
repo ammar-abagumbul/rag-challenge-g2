@@ -20,11 +20,11 @@ from transformers import CLIPModel, CLIPProcessor
 
 load_dotenv()
 
-# SEED_URLS = ["https://innowings.engg.hku.hk/", "https://innoacademy.engg.hku.hk/"]
-SEED_URLS = ["https://innoacademy.engg.hku.hk/pitching/"]
+SEED_URLS = ["https://innowings.engg.hku.hk/", "https://innoacademy.engg.hku.hk/"]
+# SEED_URLS = ["https://innoacademy.engg.hku.hk/pitching/"]
 ALLOWED_DOMAINS = {"innowings.engg.hku.hk", "innoacademy.engg.hku.hk"}
-MAX_DEPTH = 1
-DELAY_SECONDS = 1.0
+MAX_DEPTH = 20
+DELAY_SECONDS = 0.5
 CLIP_THRESHOLD = 0.90
 
 BASE_DIR = Path.cwd()
@@ -49,6 +49,7 @@ chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name="hku_innowings_scraper")
 
 visited_urls: Set[str] = set()
+transcribed_posters: Dict[str, str] = {}
 
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
@@ -67,9 +68,26 @@ NON_POSTER_PROMPTS = [
 ]
 ALL_PROMPTS = POSTER_PROMPTS + NON_POSTER_PROMPTS
 
+IMAGE_EXTENSIONS = {
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg',
+    'bmp', 'ico', 'tiff', 'heic', 'avif'
+}
+
+
+OUTPUT_JSONL = "hku_innowings_chunks.jsonl"
+
+
+#TODO: implement the following fixes
+# 1) A lot of data is already scrapped. Before the script consideres any additional pages, look through hku_innowings_chunks.jsonl and filter out urls that exist as "parent_urls". These shall be skipped as they are already processed.
+# 2) crawl_and_process is currently dfs. Change it slightly to bfs to avoid deep recursion.
+# 3) MAX_DEPTH of 20 is too much.
+# 4) We will give you with the API key to finish the scraping process. But everything is complete in terms of interface.
 
 def analyze_image_with_clip(img_url: str) -> bool:
     try:
+        if img_url in transcribed_posters:
+            return True
+
         response = requests.get(
             img_url, timeout=5, headers={"User-Agent": "Mozilla/5.0"}
         )
@@ -103,6 +121,9 @@ def analyze_image_with_clip(img_url: str) -> bool:
 
 def get_azure_vision_caption(img_url: str) -> str:
     try:
+        if img_url in transcribed_posters:
+            return transcribed_posters[img_url]
+
         response = azure_client.chat.completions.create(
             model=AZURE_VISION_MODEL,
             messages=[
@@ -119,7 +140,10 @@ def get_azure_vision_caption(img_url: str) -> str:
             ],
         )
 
-        return response.choices[0].message.content.strip()
+        caption = response.choices[0].message.content.strip()
+        transcribed_posters[img_url] = caption
+
+        return caption
     except Exception as e:
         print(f"[!] Azure OpenAI API call failed: {e}")
         return "[Error: Poster transcription unavailable]"
@@ -214,6 +238,11 @@ def clean_and_flatten_dom(soup: BeautifulSoup, base_url: str) -> List[Dict[str, 
 
     return elements_stream
 
+def is_image_url(url: str) -> bool:
+    _, ext = os.path.splitext(url)
+    clean_ext = ext.lstrip('.').lower()
+    return clean_ext in IMAGE_EXTENSIONS
+
 
 def crawl_and_process(url: str, depth: int = 1):
     """Recursive core crawler restricted to bounds and target depth limits."""
@@ -222,6 +251,9 @@ def crawl_and_process(url: str, depth: int = 1):
 
     parsed_url = urllib.parse.urlparse(url)
     if parsed_url.netloc not in ALLOWED_DOMAINS:
+        return
+
+    if is_image_url(url):
         return
 
     print(f"[*] Crawling Depth {depth}: {url}")
@@ -276,9 +308,9 @@ def crawl_and_process(url: str, depth: int = 1):
             time.sleep(DELAY_SECONDS)
             crawl_and_process(next_url, depth + 1)
 
-        output_filename = "hku_innowings_chunks.json"
-        with open(output_filename, "w", encoding="utf-8") as json_file:
-            json.dump(all_chunks_data, json_file, indent=4, ensure_ascii=False)
+        with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
+            json.dump(all_chunks_data, f, indent=4, ensure_ascii=False)
+            f.write("\n")
 
     except Exception as e:
         print(f"[!] System processing failure at URL {url}: {e}")
