@@ -17,18 +17,21 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
+from collections import deque
+
+from preprocess_jsonl import process_multiple_json_arrays
 
 load_dotenv()
 
 SEED_URLS = ["https://innowings.engg.hku.hk/", "https://innoacademy.engg.hku.hk/"]
 # SEED_URLS = ["https://innoacademy.engg.hku.hk/pitching/"]
 ALLOWED_DOMAINS = {"innowings.engg.hku.hk", "innoacademy.engg.hku.hk"}
-MAX_DEPTH = 20
+MAX_DEPTH = 5
 DELAY_SECONDS = 0.5
 CLIP_THRESHOLD = 0.90
 
 BASE_DIR = Path.cwd()
-CHROMA_PATH = BASE_DIR / "chorma_db/chroma_db"
+CHROMA_PATH = BASE_DIR / "chroma_db/chroma_db"
 
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "")
@@ -43,13 +46,36 @@ azure_client = AzureOpenAI(
 )
 AZURE_VISION_MODEL = "gpt-5-mini"
 
+PREPROCESSED_JSONL = "hku_innowings_chunks.jsonl"
+OUTPUT_JSONL = "hku_innowings_chunks2.jsonl"
+
+BLACKLIST_PATTERNS = [
+    "ast-container", "#colophon", "#content", ".entry-header",
+    "Skip to content", "Recent Posts", "Recent Comments",
+    "Archives", "Categories", "Previous image Next image",
+]
+
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 collection = chroma_client.get_or_create_collection(name="hku_innowings_scraper")
 
-visited_urls: Set[str] = set()
-transcribed_posters: Dict[str, str] = {}
+# Pre-load all existing document texts to skip exact duplicates on re-runs
+_existing = collection.get()
+seen_texts: Set[str] = set(_existing["documents"]) if _existing["documents"] else set()
+
+
+def normalize_url(url: str) -> str:
+    """Strip trailing slash from path so a/b and a/b/ are treated as the same page."""
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path.rstrip("/") or "/"
+    return parsed._replace(path=path, fragment="").geturl()
+
+
+_raw_visited, transcribed_posters = process_multiple_json_arrays(PREPROCESSED_JSONL)
+# Normalize loaded parent URLs so trailing-slash variants count as already visited
+visited_urls: Set[str] = {normalize_url(u) for u in _raw_visited}
+
 
 clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
 clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
@@ -74,14 +100,29 @@ IMAGE_EXTENSIONS = {
 }
 
 
-OUTPUT_JSONL = "hku_innowings_chunks.jsonl"
+def is_blacklisted(text: str) -> bool:
+    return any(pattern in text for pattern in BLACKLIST_PATTERNS)
 
 
-#TODO: implement the following fixes
-# 1) A lot of data is already scrapped. Before the script consideres any additional pages, look through hku_innowings_chunks.jsonl and filter out urls that exist as "parent_urls". These shall be skipped as they are already processed.
-# 2) crawl_and_process is currently dfs. Change it slightly to bfs to avoid deep recursion.
-# 3) MAX_DEPTH of 20 is too much.
-# 4) We will give you with the API key to finish the scraping process. But everything is complete in terms of interface.
+def split_text(text: str, max_len: int = 800, chunk_size: int = 600, overlap: int = 100) -> List[str]:
+    """Return text as-is if short enough; otherwise split at word boundaries with overlap."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        if end < len(text):
+            space = text.rfind(' ', start + overlap, end)
+            if space > start:
+                end = space
+        chunks.append(text[start:end].strip())
+        next_start = end - overlap
+        if next_start <= start:
+            next_start = start + chunk_size
+        start = next_start
+    return chunks
+
 
 def analyze_image_with_clip(img_url: str) -> bool:
     try:
@@ -122,7 +163,7 @@ def analyze_image_with_clip(img_url: str) -> bool:
 def get_azure_vision_caption(img_url: str) -> str:
     try:
         if img_url in transcribed_posters:
-            return transcribed_posters[img_url]
+            return transcribed_posters[img_url]["caption"]
 
         response = azure_client.chat.completions.create(
             model=AZURE_VISION_MODEL,
@@ -238,6 +279,7 @@ def clean_and_flatten_dom(soup: BeautifulSoup, base_url: str) -> List[Dict[str, 
 
     return elements_stream
 
+
 def is_image_url(url: str) -> bool:
     _, ext = os.path.splitext(url)
     clean_ext = ext.lstrip('.').lower()
@@ -316,8 +358,96 @@ def crawl_and_process(url: str, depth: int = 1):
         print(f"[!] System processing failure at URL {url}: {e}")
 
 
+def crawl_and_process_bfs(start_url: str):
+    """Iterative BFS core crawler using a queue to process levels sequentially."""
+
+    queue = deque([(normalize_url(start_url), 1)])
+
+    while queue:
+        url, depth = queue.popleft()
+        url = normalize_url(url)
+
+        if depth > MAX_DEPTH or url in visited_urls:
+            continue
+
+        parsed_url = urllib.parse.urlparse(url)
+        if parsed_url.netloc not in ALLOWED_DOMAINS:
+            continue
+
+        if is_image_url(url):
+            continue
+
+        print(f"[*] Crawling Depth {depth}: {url}")
+        visited_urls.add(url)
+
+        try:
+            response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if response.status_code != 200:
+                continue
+
+            soup = BeautifulSoup(response.content, "html.parser")
+            sections = clean_and_flatten_dom(soup, url)
+            all_chunks_data = []
+
+            for sec in sections:
+                combined_text = " ".join(sec["content_pieces"]).strip()
+                if not combined_text and not sec["images"]:
+                    continue
+
+                # Blacklist filter — drop WordPress scaffolding and nav noise
+                if is_blacklisted(combined_text):
+                    continue
+
+                # Dedup filter — skip if identical text already in ChromaDB
+                if combined_text in seen_texts:
+                    continue
+                seen_texts.add(combined_text)
+
+                # Split large chunks into overlapping sub-chunks
+                sub_texts = split_text(combined_text)
+
+                for sub_text in sub_texts:
+                    chunk_id = f"hku_innowings_chunk_{uuid.uuid4()}"
+                    chunk_data = {
+                        "chunk_id": chunk_id,
+                        "parent_url": url,
+                        "text_content": sub_text,
+                        "associated_images": sec["images"],
+                        "url_mappings": sec["url_mappings"],
+                    }
+                    all_chunks_data.append(chunk_data)
+
+                    collection.add(
+                        documents=[sub_text],
+                        metadatas=[{
+                            "parent_url": url,
+                            "images_json": str(sec["images"]),
+                            "urls_json": str(sec["url_mappings"]),
+                        }],
+                        ids=[chunk_id],
+                    )
+
+            with open(OUTPUT_JSONL, "a", encoding="utf-8") as f:
+                json.dump(all_chunks_data, f, indent=4, ensure_ascii=False)
+                f.write("\n")
+
+            # Extract child links — normalize before queuing
+            for anchor in soup.find_all("a", href=True):
+                next_url = urllib.parse.urljoin(url, anchor["href"])
+                next_url = normalize_url(next_url)
+
+                if next_url not in visited_urls:
+                    queue.append((next_url, depth + 1))
+
+            # Politeness delay between requests
+            time.sleep(DELAY_SECONDS)
+
+        except Exception as e:
+            print(f"[!] System processing failure at URL {url}: {e}")
+
+
 if __name__ == "__main__":
     print("[=== Executing Tam Innovation Wing Scraper Init Pipeline ===]")
     for seed in SEED_URLS:
-        crawl_and_process(seed, depth=1)
+        crawl_and_process_bfs(seed)
     print(f"\n[=== Scrape Complete! Total Chunks Cached: {collection.count()} ===]")
