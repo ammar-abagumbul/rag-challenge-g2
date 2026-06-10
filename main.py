@@ -39,7 +39,7 @@ def _utf8_open(file, mode="r", buffering=-1, encoding=None, *args, **kwargs):
 
 _builtins.open = _utf8_open
 
-from rag import generate_rag_answers
+from rag import generate_rag_answers, rag_answer
 from rag import retrieval
 
 
