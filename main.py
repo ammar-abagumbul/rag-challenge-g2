@@ -6,7 +6,38 @@ Usage:
     python main.py --retrieval-only "q"  # show retrieved chunks, no LLM answer
 """
 
+import builtins as _builtins
 import sys
+
+# The competition harness runs this file verbatim, including a bare
+#   json.load(open('competition_questions.json'))
+# and a final print(list(results)). On a Windows cp1252 locale that read can
+# fail to decode a UTF-8 questions file, and the print can crash on non-ASCII
+# model output (em-dashes / curly quotes from gpt-4o-mini). We have no control
+# over that command, so we make the process UTF-8 safe at import time -- this
+# runs even via `from main import generate_rag_answers`.
+
+# 1) stdout/stderr -> UTF-8 so printing answers can't raise UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
+# 2) Default text-mode open() to UTF-8 so the harness's encoding-less
+#    open('competition_questions.json') decodes a UTF-8 file correctly under a
+#    cp1252 default locale. Binary mode (model weights, the sqlite DB) is left
+#    untouched, and an explicit encoding= is always respected.
+_real_open = _builtins.open
+
+
+def _utf8_open(file, mode="r", buffering=-1, encoding=None, *args, **kwargs):
+    if "b" not in mode and encoding is None:
+        encoding = "utf-8"
+    return _real_open(file, mode, buffering, encoding, *args, **kwargs)
+
+
+_builtins.open = _utf8_open
 
 from rag import generate_rag_answers
 from rag import retrieval
