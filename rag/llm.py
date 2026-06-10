@@ -15,28 +15,50 @@ import re
 from functools import lru_cache
 from typing import List, Sequence
 
-from openai import AzureOpenAI
+from openai import OpenAI
 
 from . import config
 
 
 @lru_cache(maxsize=1)
-def _client() -> AzureOpenAI:
-    """Lazily build a single shared Azure client (created on first LLM use)."""
-    return AzureOpenAI(
-        azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
-        api_key=config.require_api_key(),
-        api_version=config.AZURE_OPENAI_API_VERSION,
+def _client() -> OpenAI:
+    """Lazily build a single shared client (created on first LLM use).
+
+    Targets the InnoWings APIM gateway directly: base_url already includes the
+    deployment, `api-version` is sent as a query param, and auth is the
+    `api-key` header (the gateway rejects the standard Bearer / Ocp-Apim forms).
+    A bounded per-call timeout + retry budget keeps the critical path
+    predictable so the pipeline stays well within its latency target.
+    """
+    key = config.require_api_key()
+    return OpenAI(
+        base_url=f"{config.CHAT_ENDPOINT}/deployments/{config.CHAT_MODEL}",
+        api_key=key,
+        default_query={"api-version": config.AZURE_OPENAI_API_VERSION},
+        default_headers={"api-key": key},
+        timeout=config.ANSWER_TIMEOUT,        # client-level safety default
+        max_retries=config.LLM_MAX_RETRIES,
     )
 
 
-def _chat(messages: list, *, temperature: float = 0.0, max_tokens: int = 512) -> str:
-    """Single chat completion call, returning the assistant text."""
+def _chat(
+    messages: list,
+    *,
+    temperature: float = 0.0,
+    max_tokens: int = 512,
+    timeout: float = config.LLM_TIMEOUT,
+) -> str:
+    """Single chat completion call, returning the assistant text.
+
+    `timeout` is enforced per request so each pipeline stage has its own bound;
+    on expiry the SDK raises and the caller degrades gracefully.
+    """
     resp = _client().chat.completions.create(
         model=config.CHAT_MODEL,
         messages=messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=timeout,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -215,9 +237,12 @@ def generate_answer(question: str, contexts: Sequence[str]) -> str:
     )
     system = (
         "You are a helpful assistant answering questions about HKU InnoWings / "
-        "InnoAcademy using only the provided sources. Be accurate and concise. "
-        "If the sources do not contain the answer, say so plainly instead of "
-        "guessing."
+        "InnoAcademy using only the provided sources. Be accurate. When the "
+        "question asks you to list or enumerate items (e.g. 'what are the X', "
+        "'list all Y'), include EVERY distinct item that appears across the "
+        "sources, not just the first few -- scan all sources before answering. "
+        "Otherwise be concise. If the sources do not contain the answer, say so "
+        "plainly instead of guessing."
     )
     user = f"Question: {question}\n\nSources:\n{context_block}\n\nAnswer:"
     try:
@@ -226,6 +251,7 @@ def generate_answer(question: str, contexts: Sequence[str]) -> str:
              {"role": "user", "content": user}],
             temperature=0.2,
             max_tokens=600,
+            timeout=config.ANSWER_TIMEOUT,
         )
     except Exception as exc:
         return f"[answer generation failed: {exc}]"

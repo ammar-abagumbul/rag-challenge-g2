@@ -10,6 +10,8 @@ Implements the two retrieval modes that feed the reranker:
 merges/deduplicates the candidates, and hands the pool to the LLM reranker.
 """
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Dict, List
@@ -90,17 +92,21 @@ def retrieve(question: str, *, verbose: bool = True) -> List[Chunk]:
 
     Returns the top FINAL_TOP_N chunks after LLM reranking.
     """
-    # 1. Query decomposition / rewriting.
-    subqueries = llm.decompose_query(question)
+    # 1+2. Decomposition and keyword generation are independent LLM calls, so
+    #      run them concurrently to shave one round-trip off the critical path.
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_sub = ex.submit(llm.decompose_query, question)
+        f_kw = ex.submit(llm.generate_keywords, question)
+        subqueries = f_sub.result()
+        keywords = f_kw.result()
     if verbose:
         print(f"  Sub-queries ({len(subqueries)}): {subqueries}")
-
-    # 2. Keyword generation (once for the whole question).
-    keywords = llm.generate_keywords(question)
-    if verbose:
         print(f"  Keywords: {keywords}")
+        print(f"  [t] decompose+keywords: {time.perf_counter() - t0:.2f}s")
 
     # 3. Fan out both retrieval modes and merge into a single candidate pool.
+    t0 = time.perf_counter()
     pool: Dict[str, Chunk] = {}
     for sq in subqueries:
         for chunk in semantic_search(sq):
@@ -110,15 +116,18 @@ def retrieve(question: str, *, verbose: bool = True) -> List[Chunk]:
 
     candidates = list(pool.values())[: config.CANDIDATE_POOL]
     if verbose:
-        print(f"  Candidate pool: {len(candidates)} unique chunks")
+        print(f"  Candidate pool: {len(candidates)} unique chunks "
+              f"[t] retrieval: {time.perf_counter() - t0:.2f}s")
     if not candidates:
         return []
 
     # 4. LLM rerank against the ORIGINAL question, then keep the top N.
+    t0 = time.perf_counter()
     order = llm.rerank(question, [c.text for c in candidates], config.FINAL_TOP_N)
     reranked = [candidates[i] for i in order]
     if verbose:
-        print(f"  Reranked -> kept {len(reranked)} chunks")
+        print(f"  Reranked -> kept {len(reranked)} chunks "
+              f"[t] rerank: {time.perf_counter() - t0:.2f}s")
     return reranked
 
 
