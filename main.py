@@ -18,7 +18,9 @@ def _retrieval_only(question: str) -> None:
     print(f"\n=== Top {len(chunks)} chunks for: {question!r} ===")
     for i, c in enumerate(chunks, 1):
         tags = ",".join(sorted(c.sources))
-        print(f"\n[{i}] ({tags}) {c.metadata.get('parent_url', '')}")
+        origin = c.metadata.get("image_name") or c.metadata.get("parent_url", "")
+        kind = "image" if c.metadata.get("source_type") == "local_image" else "text"
+        print(f"\n[{i}] ({tags}|{kind}) {origin}")
         print(c.text[:300].strip())
 
 
