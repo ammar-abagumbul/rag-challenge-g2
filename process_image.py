@@ -1,7 +1,6 @@
 import os 
 import torch
 from PIL import Image
-from transformers import CLIPModel, CLIPProcessor
 from pathlib import Path
 from typing import List,Dict
 import chromadb
@@ -9,6 +8,7 @@ from dotenv import load_dotenv
 from openai import AzureOpenAI
 import json
 from tqdm import tqdm
+import uuid
 load_dotenv()
 
 BASE_DIR=Path.cwd()
@@ -23,10 +23,7 @@ azure_client = AzureOpenAI(
     api_version="2025-01-01-preview",
 )
 chroma_client=chromadb.PersistentClient(path=CHROMA_PATH)
-collection=chroma_client.get_or_create_collection(name="image_embeddings") # TODO: change name to the shared name
 processed_images=[]
-# clip_model=CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-# clip_processor=CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 def get_azure_caption(image_path: str) -> str:
     try:
         import base64
@@ -68,9 +65,12 @@ if __name__=="__main__":
     for img in tqdm(image_paths, desc="Processing images", unit="image"):
         caption = json.loads(get_azure_caption(img))
         processed_images.append({
-            "image_name": str(img.name),
-            "description": str(caption["description"]),
-            "caption": str(caption["caption"])
+            "chunk_id":f"hku_innowings_chunk_{uuid.uuid4()}",
+            "parent_url":"",
+            "image_name":str(img.name),
+            "text_content":f"{str(caption['caption'])}: {str(caption['description'])}",
+            "associated_image":[],
+            "url_mappings":{}
         })
     with open(BASE_DIR/'processed_images.json', 'w') as f:
         json.dump(processed_images, f, indent=4)
